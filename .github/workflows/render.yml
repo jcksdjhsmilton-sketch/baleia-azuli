@@ -1,0 +1,152 @@
+name: Renderizar video (Baleia Azul)
+
+on:
+  push:
+    paths:
+      - "audio/narracao.mp3"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: render-video
+  cancel-in-progress: true
+
+env:
+  FPS: "30"
+  RENDER_W: "720"
+  RENDER_H: "1280"
+  SAMPLES: "32"
+  CHUNK_FRAMES: "150"
+  BLENDER_VERSION: "4.2.3"
+  WHISPER_MODEL: "small"
+
+jobs:
+  checagem:
+    name: Checagem (sintaxe + ambiente + 1 frame de cada cena)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Sintaxe dos scripts
+        run: python -m py_compile pipeline/*.py
+      - run: pip install pillow num2words
+      - run: bash pipeline/get_fonts.sh
+      - name: HUD (1 frame por cena)
+        run: python pipeline/compose.py --selftest
+      - uses: actions/cache@v4
+        with:
+          path: ~/blender
+          key: blender-${{ env.BLENDER_VERSION }}
+      - name: Instalar Blender
+        run: bash pipeline/install_blender.sh
+      - name: Blender renderiza 1 frame mini de cada cena
+        run: |
+          mkdir -p smoke
+          "$BLENDER_BIN" -b --factory-startup -P pipeline/blender_scene.py -- --smoke --out smoke
+          ls smoke
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checagem
+          path: smoke
+          retention-days: 3
+
+  preparar:
+    name: Alinhar narração com o roteiro
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plano.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: sudo apt-get install -y ffmpeg
+      - run: pip install pillow num2words faster-whisper
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: whisper-${{ env.WHISPER_MODEL }}
+      - name: Gerar timeline
+        id: plano
+        run: python pipeline/prepare.py --audio audio/narracao.mp3 --out build/timeline.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: timeline
+          path: build/timeline.json
+          retention-days: 3
+
+  renderizar:
+    name: render ${{ matrix.tag }}
+    needs: [checagem, preparar]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.preparar.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/blender
+          key: blender-${{ env.BLENDER_VERSION }}
+      - run: bash pipeline/install_blender.sh
+      - uses: actions/download-artifact@v4
+        with:
+          name: timeline
+          path: build
+      - name: Renderizar frames (Cycles CPU)
+        run: |
+          mkdir -p frames chunks
+          "$BLENDER_BIN" -b --factory-startup -P pipeline/blender_scene.py -- \
+            --timeline build/timeline.json --scene ${{ matrix.scene }} \
+            --start ${{ matrix.start }} --end ${{ matrix.end }} --out frames \
+            --width $RENDER_W --height $RENDER_H --samples $SAMPLES
+      - name: Codificar pedaço
+        run: |
+          ffmpeg -y -v error -framerate $FPS -start_number ${{ matrix.start }} \
+            -i frames/f${{ matrix.scene }}_%05d.png -frames:v ${{ matrix.count }} \
+            -c:v libx264 -crf 10 -preset veryfast -pix_fmt yuv420p chunks/c_${{ matrix.tag }}.mp4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chunk-${{ matrix.tag }}
+          path: chunks/c_${{ matrix.tag }}.mp4
+          retention-days: 3
+
+  montar:
+    name: Montar video final
+    needs: [preparar, renderizar]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install pillow num2words
+      - run: bash pipeline/get_fonts.sh
+      - uses: actions/download-artifact@v4
+        with:
+          name: timeline
+          path: build
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: chunk-*
+          merge-multiple: true
+          path: chunks
+      - name: Juntar pedaços 3D
+        run: |
+          for f in $(ls chunks/*.mp4 | sort); do echo "file '$(realpath $f)'"; done > list.txt
+          ffmpeg -y -v error -f concat -safe 0 -i list.txt -c copy build/raw3d.mp4
+      - name: HUD + legendas + áudio
+        run: python pipeline/compose.py --timeline build/timeline.json --video build/raw3d.mp4 --audio audio/narracao.mp3 --out out/baleia_azul.mp4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: video-final
+          path: out/baleia_azul.mp4
+          retention-days: 14
+      - name: Publicar em Releases (baixa fácil no celular)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "video-${{ github.run_number }}" out/baleia_azul.mp4 --title "Baleia Azul #${{ github.run_number }}" --notes "Vídeo renderizado automaticamente."
